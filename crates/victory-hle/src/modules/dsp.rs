@@ -1,24 +1,28 @@
 //! The console's audio DSP (`chad.dll`): streams that convolve blocks of
-//! float samples with an impulse response (reverb), or run other block
-//! transforms, on a coprocessor.
+//! float samples with an impulse response (reverb), or run forward and
+//! inverse FFTs over them, on a coprocessor.
 //!
 //! A title connects once with a memory block for the DSP, activates
-//! streams, and submits one command per block (gains, an input and an
+//! streams, and submits one command per block (a gain ramp, an input and an
 //! output buffer). Activation hands back a status block whose second word is
 //! the ticket of the last completed command and whose fourth is its result;
 //! the title checks it one block later and treats a late command as an
 //! overrun. Commands complete when submitted here.
 //!
-//! The transforms themselves are not computed: the hardware takes impulse
-//! responses already in its own partitioned frequency-domain layout, which
-//! is not known. Outputs are silence, so reverb returns are dry.
-// shortcut: no convolution or block transform; outputs are zeros. Needs the
-// coprocessor's impulse response and spectrum layouts to do better.
+//! We compute each command when it is submitted, with
+//! [`victory_formats::xdsp`]: convolution takes the impulse response in
+//! partitions of one block's worth of complex values, and the transforms
+//! read and write the same packed spectra.
+// shortcut: the hardware's spectrum layout is inferred (see `xdsp`). If a
+// title's reverb sounds wrong while it ships its responses already
+// transformed, the packing, bin order or scaling there is the suspect.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
 use std::sync::Mutex;
+
+use victory_formats::xdsp::{self, Convolver, Transform};
 
 use super::xasync::E_INVALIDARG;
 use super::xgameruntime::{HRESULT, S_OK};
@@ -28,9 +32,16 @@ const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
 const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
 
 const CONVOLUTION: u32 = 1;
-/// Option bits that need a stereo stream, and one convolution refuses.
-const STEREO_OPTIONS: u32 = 2 | 8;
-const NOT_FOR_CONVOLUTION: u32 = 4;
+const FORWARD_FFT: u32 = 2;
+const INVERSE_FFT: u32 = 3;
+/// Stereo input and output come as one block per channel.
+const DEINTERLEAVED: u32 = 2;
+/// Spectra in magnitude and phase; transforms only.
+const POLAR: u32 = 4;
+/// Two impulse responses, left then right.
+const STEREO_RESPONSE: u32 = 8;
+/// Option bits that need a stereo stream.
+const STEREO_OPTIONS: u32 = DEINTERLEAVED | STEREO_RESPONSE;
 
 pub struct Dsp {
     max_streams: u32,
@@ -57,20 +68,42 @@ pub struct Status {
     result: HRESULT,
 }
 
+enum Work {
+    Convolution {
+        convolver: Convolver,
+        deinterleaved: bool,
+    },
+    /// No impulse response to convolve with: silence.
+    Silence,
+    Forward {
+        transform: Transform,
+        polar: bool,
+    },
+    Inverse {
+        transform: Transform,
+        polar: bool,
+    },
+}
+
 pub struct Stream {
     dsp: *mut Dsp,
     frames: u32,
     channels: u32,
+    work: Work,
     status: Box<Status>,
 }
 
 /// One block of work.
 #[repr(C)]
 pub struct Command {
-    gains: [f32; 2],
+    /// The output's gain at the first frame, ramping towards `end_scale`
+    /// (convolution only).
+    begin_scale: f32,
+    end_scale: f32,
     input: *const f32,
     output: *mut f32,
-    reserved: u64,
+    /// Multiplies the input before a forward transform.
+    multiplier: *const f32,
 }
 
 pub extern "system" fn XDspConnectWithMaximumStreamLimit(
@@ -120,12 +153,15 @@ pub extern "system" fn XDspDisconnect(dsp: *mut Dsp) -> HRESULT {
 
 fn valid(desc: &StreamDesc) -> bool {
     let (kind, options, frames, channels) = (desc.kind, desc.options, desc.frames, desc.channels);
-    let shape = if kind == CONVOLUTION {
-        (1..=2).contains(&channels)
-            && matches!(frames, 0x200 | 0x400)
-            && options & NOT_FOR_CONVOLUTION == 0
-    } else {
-        channels == 1 && matches!(frames, 0x200 | 0x400 | 0x800)
+    let shape = match kind {
+        CONVOLUTION => {
+            (1..=2).contains(&channels)
+                && matches!(frames, 0x200 | 0x400)
+                && options & POLAR == 0
+                && !desc.ir.is_null()
+        }
+        FORWARD_FFT | INVERSE_FFT => channels == 1 && matches!(frames, 0x200 | 0x400 | 0x800),
+        _ => false,
     };
     shape && (options & STEREO_OPTIONS == 0 || channels == 2)
 }
@@ -164,10 +200,22 @@ pub extern "system" fn XDspActivate(
         }
         *active += 1;
     }
+    let work = match kind {
+        CONVOLUTION => convolution(desc),
+        FORWARD_FFT => Work::Forward {
+            transform: Transform::new(frames as usize),
+            polar: options & POLAR != 0,
+        },
+        _ => Work::Inverse {
+            transform: Transform::new(frames as usize),
+            polar: options & POLAR != 0,
+        },
+    };
     let new = Box::new(Stream {
         dsp,
-        frames: desc.frames,
-        channels: desc.channels,
+        frames,
+        channels,
+        work,
         status: Box::new(Status {
             submitted: 0,
             completed: 0,
@@ -183,6 +231,40 @@ pub extern "system" fn XDspActivate(
     S_OK
 }
 
+/// Copies the title's impulse response into a convolver. Partitions are
+/// whole blocks; a remainder is dropped, as the hardware counts them.
+fn convolution(desc: &StreamDesc) -> Work {
+    let (frames, channels) = (desc.frames as usize, desc.channels as usize);
+    let floats = desc.ir_floats as usize;
+    let usable = floats / (2 * frames) * (2 * frames);
+    let responses = if channels == 2 && desc.options & STEREO_RESPONSE != 0 {
+        2
+    } else {
+        1
+    };
+    if usable == 0 {
+        tracing::warn!(
+            floats,
+            frames,
+            "audio DSP: impulse response shorter than a partition"
+        );
+        return Work::Silence;
+    }
+    let mut response = Vec::with_capacity(usable * responses);
+    for r in 0..responses {
+        // SAFETY: the title's response holds `floats` floats per channel.
+        let channel = unsafe { std::slice::from_raw_parts(desc.ir.add(r * floats), usable) };
+        response.extend_from_slice(channel);
+    }
+    match Convolver::new(frames, channels, &response, usable, responses) {
+        Some(convolver) => Work::Convolution {
+            convolver,
+            deinterleaved: desc.options & DEINTERLEAVED != 0,
+        },
+        None => Work::Silence,
+    }
+}
+
 pub extern "system" fn XDspDeactivate(stream: *mut Stream) -> HRESULT {
     if stream.is_null() {
         return E_INVALIDARG;
@@ -195,7 +277,67 @@ pub extern "system" fn XDspDeactivate(stream: *mut Stream) -> HRESULT {
     S_OK
 }
 
-/// Completes the command at once: its output block is silence.
+/// Runs one block through a stream's work into `output`.
+fn run(stream: &mut Stream, command: &Command, input: &[f32], output: &mut [f32]) {
+    let frames = stream.frames as usize;
+    match &mut stream.work {
+        Work::Convolution {
+            convolver,
+            deinterleaved,
+        } => {
+            let channels = convolver.channels();
+            let (begin, end) = (command.begin_scale, command.end_scale);
+            if channels == 1 || *deinterleaved {
+                for (c, (i, o)) in input
+                    .chunks(frames)
+                    .zip(output.chunks_mut(frames))
+                    .enumerate()
+                {
+                    convolver.process(c, i, o);
+                    xdsp::ramp(o, frames, 1, begin, end);
+                }
+            } else {
+                let mut lane = vec![0.0; frames];
+                let mut out = vec![0.0; frames];
+                for c in 0..channels {
+                    for (l, frame) in lane.iter_mut().zip(input.chunks(channels)) {
+                        *l = frame[c];
+                    }
+                    convolver.process(c, &lane, &mut out);
+                    for (frame, s) in output.chunks_mut(channels).zip(&out) {
+                        frame[c] = *s;
+                    }
+                }
+                xdsp::ramp(output, frames, channels, begin, end);
+            }
+        }
+        Work::Silence => output.fill(0.0),
+        Work::Forward { transform, polar } => {
+            if command.multiplier.is_null() {
+                transform.forward(input, output);
+            } else {
+                // SAFETY: the title's multiplier holds one block.
+                let multiplier = unsafe { std::slice::from_raw_parts(command.multiplier, frames) };
+                let product: Vec<f32> = input.iter().zip(multiplier).map(|(a, b)| a * b).collect();
+                transform.forward(&product, output);
+            }
+            if *polar {
+                xdsp::to_polar(output);
+            }
+        }
+        Work::Inverse { transform, polar } => {
+            if *polar {
+                let mut cartesian = input.to_vec();
+                xdsp::from_polar(&mut cartesian);
+                transform.inverse(&cartesian, output);
+            } else {
+                transform.inverse(input, output);
+            }
+        }
+    }
+}
+
+/// Computes the command and completes it at once.
 pub extern "system" fn XDspSubmitCommand(
     stream: *mut Stream,
     command: *const Command,
@@ -209,7 +351,14 @@ pub extern "system" fn XDspSubmitCommand(
     if !command.output.is_null() {
         let samples = (stream.frames * stream.channels) as usize;
         // SAFETY: the title's output buffer holds one block of the stream.
-        unsafe { std::ptr::write_bytes(command.output, 0, samples) };
+        let output = unsafe { std::slice::from_raw_parts_mut(command.output, samples) };
+        if command.input.is_null() {
+            output.fill(0.0);
+        } else {
+            // SAFETY: the title's input buffer holds one block of the stream.
+            let input = unsafe { std::slice::from_raw_parts(command.input, samples) };
+            run(stream, command, input, output);
+        }
     }
     let status = &mut *stream.status;
     let next = status.submitted.wrapping_add(1);
@@ -244,6 +393,24 @@ pub(crate) fn module() -> HleModule {
 mod tests {
     use super::*;
 
+    fn submit(
+        stream: *mut Stream,
+        input: &[f32],
+        output: &mut [f32],
+        multiplier: *const f32,
+    ) -> u32 {
+        let command = Command {
+            begin_scale: 1.0,
+            end_scale: 1.0,
+            input: input.as_ptr(),
+            output: output.as_mut_ptr(),
+            multiplier,
+        };
+        let mut ticket = 0;
+        assert_eq!(XDspSubmitCommand(stream, &command, &mut ticket), S_OK);
+        ticket
+    }
+
     #[test]
     fn convolution_stream_as_the_title_drives_it() {
         let mut base = vec![0u8; 0x10_0000];
@@ -259,11 +426,15 @@ mod tests {
             ),
             S_OK
         );
-        let ir = vec![0f32; 0x800];
-        // Stereo convolution with option 2, as the title asks for.
+        // A response that delays by 3 frames at half gain, in one partition.
+        let mut taps = vec![0f32; 0x400];
+        taps[3] = 0.5;
+        let ir = xdsp::partition(&taps, 0x400);
+        assert_eq!(ir.len(), 0x800);
+        // Stereo, deinterleaved, one mono response, as the title asks for.
         let desc = StreamDesc {
             kind: CONVOLUTION,
-            options: 2,
+            options: DEINTERLEAVED,
             frames: 0x400,
             channels: 2,
             ir_floats: 0x800,
@@ -271,20 +442,18 @@ mod tests {
         };
         let (mut status, mut stream) = (std::ptr::null(), std::ptr::null_mut());
         assert_eq!(XDspActivate(dsp, &desc, &mut status, &mut stream), S_OK);
-        let mut output = vec![1f32; 0x800];
-        let input = vec![0.5f32; 0x800];
-        let command = Command {
-            gains: [1.0, 1.0],
-            input: input.as_ptr(),
-            output: output.as_mut_ptr(),
-            reserved: 0,
-        };
-        let mut ticket = 0;
-        assert_eq!(XDspSubmitCommand(stream, &command, &mut ticket), S_OK);
+        let input: Vec<f32> = (0..0x800).map(|i| (i % 7) as f32).collect();
+        let mut output = vec![9f32; 0x800];
+        let ticket = submit(stream, &input, &mut output, std::ptr::null());
         // SAFETY: the stream's status block.
         let (completed, result) = unsafe { ((*status).completed, (*status).result) };
         assert_eq!((completed, result), (ticket, S_OK));
-        assert!(output.iter().all(|&s| s == 0.0));
+        for (c, (i, o)) in input.chunks(0x400).zip(output.chunks(0x400)).enumerate() {
+            for n in 0..0x400 {
+                let expected = if n >= 3 { 0.5 * i[n - 3] } else { 0.0 };
+                assert!((o[n] - expected).abs() < 1e-3, "channel {c} frame {n}");
+            }
+        }
         assert_eq!(XDspDeactivate(stream), S_OK);
 
         // Mono streams refuse stereo options; transforms are mono only.
@@ -296,19 +465,48 @@ mod tests {
             XDspActivate(dsp, &bad, &mut status, &mut stream),
             E_INVALIDARG
         );
-        let transform = StreamDesc {
-            kind: 2,
-            options: 0,
-            channels: 1,
-            ir_floats: 0,
-            ir: std::ptr::null(),
-            ..desc
-        };
+        assert_eq!(XDspDisconnect(dsp), S_OK);
+    }
+
+    #[test]
+    fn transform_streams_round_trip() {
+        let mut base = vec![0u8; 0x10_0000];
+        let mut dsp = std::ptr::null_mut();
         assert_eq!(
-            XDspActivate(dsp, &transform, &mut status, &mut stream),
+            XDspConnectWithMaximumStreamLimit(
+                base.as_mut_ptr().cast(),
+                0x10_0000,
+                0,
+                4,
+                1,
+                &mut dsp
+            ),
             S_OK
         );
-        assert_eq!(XDspDeactivate(stream), S_OK);
+        let mut streams = [std::ptr::null_mut(); 2];
+        let mut status = std::ptr::null();
+        for (stream, kind) in streams.iter_mut().zip([FORWARD_FFT, INVERSE_FFT]) {
+            let desc = StreamDesc {
+                kind,
+                options: POLAR,
+                frames: 0x200,
+                channels: 1,
+                ir_floats: 0,
+                ir: std::ptr::null(),
+            };
+            assert_eq!(XDspActivate(dsp, &desc, &mut status, stream), S_OK);
+        }
+        let input: Vec<f32> = (0..0x200).map(|i| ((i * 37) % 11) as f32 - 5.0).collect();
+        let window = vec![0.5f32; 0x200];
+        let (mut spectrum, mut back) = (vec![0f32; 0x200], vec![0f32; 0x200]);
+        submit(streams[0], &input, &mut spectrum, window.as_ptr());
+        submit(streams[1], &spectrum, &mut back, std::ptr::null());
+        for (b, i) in back.iter().zip(&input) {
+            assert!((b - 0.5 * i).abs() < 1e-3, "{b} vs {}", 0.5 * i);
+        }
+        for stream in streams {
+            assert_eq!(XDspDeactivate(stream), S_OK);
+        }
         assert_eq!(XDspDisconnect(dsp), S_OK);
     }
 }
