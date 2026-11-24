@@ -54,6 +54,9 @@ pub(crate) struct Lowered {
     /// Test builds: typed loads assembled from a dword-aligned pair.
     #[cfg(test)]
     pub unaligned_typed_loads: u32,
+    /// The functions the program declares (`dx.op.<name>`).
+    #[cfg(test)]
+    pub functions: Vec<String>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1194,6 +1197,8 @@ impl<'a> Lower<'a> {
             cbuffer_handles: self.s.cbuffer_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            functions: self.s.m.function_names(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -6793,11 +6798,10 @@ impl<'a> Lower<'a> {
             if name != "image_store" {
                 return Err("an image store to a mip level");
             }
-            // shortcut: stores are taken to write all four channels of a
-            // float format (the console converts by the view's format).
-            if *dmask != 0xF {
-                return Err("an image store of some channels");
-            }
+            // shortcut: stores are taken to be of a float format (the
+            // console converts by the view's format). The channels dmask
+            // leaves out are written as 0: DXIL writes all four of a typed
+            // view, and those past the view's format are dropped anyway.
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
@@ -6807,13 +6811,21 @@ impl<'a> Lower<'a> {
                 return Err("image store data");
             };
             let mut vals = Vec::new();
-            for k in 0..4u8 {
-                // d16: two f16 channels per VGPR, low half first.
+            let mut k = 0u8;
+            for channel in 0..4 {
+                if *dmask >> channel & 1 == 0 {
+                    vals.push(self.s.m.f32(0));
+                    continue;
+                }
+                // The enabled channels in consecutive VGPRs; d16: two f16
+                // channels per VGPR, low half first.
                 let r = if *d16 { k / 2 } else { k };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
+                let high = k % 2 == 1;
+                k += 1;
                 vals.push(if *d16 {
                     let mut x = self.i32_of(v)?;
-                    if k % 2 == 1 {
+                    if high {
                         let k16 = self.s.m.i32(16);
                         x = self.s.m.bin(self.cur, Bin::LShr, x, k16);
                     }
@@ -9434,6 +9446,55 @@ mod tests {
             v.validate(&mut l.dxil.clone())
                 .expect("DXIL validation failed");
         }
+    }
+
+    /// A 2D image UAV descriptor from the table at s0, then `access` on
+    /// it with coordinates v[0:1] and data from v4 on, and v4 stored to LDS.
+    fn image_access(access: [u32; 2]) -> Result<Lowered, crate::ShaderError> {
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0202,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], null
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0x7E08_0281, // v_mov_b32 v4, 1
+            0x7E0A_0280, // v_mov_b32 v5, 0
+            0x7E0C_0282, // v_mov_b32 v6, 2
+            0x7E0E_0280, // v_mov_b32 v7, 0
+            access[0],
+            access[1],
+            0xD834_0000,
+            0x0000_0400, // ds_write_b32 v0, v4
+            S_ENDPGM,
+        ];
+        let used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        }];
+        lower_with(&words, vec![root(RootType::Table, 0, 0)], used)
+    }
+
+    fn declares(l: &Lowered, op: &str) -> bool {
+        l.functions.iter().any(|f| f == &format!("dx.op.{op}"))
+    }
+
+    #[test]
+    fn image_stores_of_some_channels_write_the_others_as_zero() {
+        // image_store v4, v[0:1], s[8:15] dmask:0x1 dim:2D (an R32 view)
+        let one = image_access([0xF020_0108, 0x0002_0400]).unwrap();
+        assert!(declares(&one, "textureStore.f32"));
+        // image_store v[4:5], v[0:1], s[8:15] dmask:0x5 dim:2D
+        let two = image_access([0xF020_0508, 0x0002_0400]).unwrap();
+        assert!(declares(&two, "textureStore.f32"));
+        // image_store v[4:5], v[0:1], s[8:15] dmask:0x7 dim:2D d16: three
+        // halves in two VGPRs.
+        assert!(image_access([0xF020_0708, 0x8002_0400]).is_ok());
     }
 
     #[test]

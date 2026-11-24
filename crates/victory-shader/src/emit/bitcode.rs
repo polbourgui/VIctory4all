@@ -330,6 +330,12 @@ impl Module {
         V::Func(i)
     }
 
+    /// The names of the functions declared so far.
+    #[cfg(test)]
+    pub fn function_names(&self) -> Vec<String> {
+        self.funcs.iter().map(|f| f.name.clone()).collect()
+    }
+
     /// An external global of type `ty` in address space `space` (DXIL
     /// declares thread-group shared memory this way).
     pub fn global(&mut self, name: &str, ty: Ty, space: u32) -> V {
