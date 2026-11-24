@@ -29,6 +29,9 @@ enum Val {
     Missing(Why),
 }
 
+/// A heap handle's block, load, first dword, kind and annotation.
+type HandleKey = (usize, Site, u8, bool, (u32, u32));
+
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
     /// Bit n: immediate sampler n is used for comparisons.
@@ -43,6 +46,12 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// The functions the program declares (`dx.op.<name>`).
+    #[cfg(test)]
+    pub functions: Vec<String>,
+    /// Cube samples taken as a cube array's.
+    #[cfg(test)]
+    pub cube_arrays: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -173,7 +182,10 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    handles: HashMap<HandleKey, V>,
+    /// Cube samples taken as a cube array's.
+    #[cfg(test)]
+    cube_arrays: u32,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -479,6 +491,8 @@ impl<'a> Lower<'a> {
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
+            #[cfg(test)]
+            cube_arrays: 0,
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -910,6 +924,10 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            functions: self.s.m.function_names(),
+            #[cfg(test)]
+            cube_arrays: self.cube_arrays,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -3308,7 +3326,7 @@ impl<'a> Lower<'a> {
     ) -> Result<V, Why> {
         match src {
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props.0);
+                let key = (self.cur, *load, *first, sampler, props);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
@@ -4296,6 +4314,17 @@ impl<'a> Lower<'a> {
                 Ok(self.s.m.cast(c, Cast::ZExt, x, i64t))
             }
         }
+    }
+
+    /// The i64 of a low and a high dword.
+    fn join64(&mut self, lo: V, hi: V) -> V {
+        let c = self.cur;
+        let i64t = self.s.m.int(64);
+        let lo = self.s.m.cast(c, Cast::ZExt, lo, i64t);
+        let hi = self.s.m.cast(c, Cast::ZExt, hi, i64t);
+        let k32 = self.s.m.int_const(i64t, 32);
+        let hi = self.s.m.bin(c, Bin::Shl, hi, k32);
+        self.s.m.bin(c, Bin::Or, lo, hi)
     }
 
     /// The low and high dwords of an i64.
@@ -5602,7 +5631,7 @@ impl<'a> Lower<'a> {
         let site = (b, i);
         let guard = self.guard(b, i)?;
         let c = self.cur;
-        let (kind, coords) = match dim {
+        let (mut kind, coords) = match dim {
             0 => (1, 1),
             1 => (2, 2),
             2 => (4, 3),
@@ -5623,6 +5652,22 @@ impl<'a> Lower<'a> {
         for a in addr {
             if let Operand::Vector { reg, dwords } = *a {
                 regs.extend((0..dwords).map(|k| reg + k));
+            }
+        }
+        if kind == 5 && !*a16 && name != "image_get_resinfo" {
+            // The face is the third coordinate, after any offset, bias or
+            // comparison value (cube samples take no gradients).
+            let first = usize::from(name.ends_with("_o"))
+                + usize::from(name == "image_sample_b")
+                + usize::from(matches!(name, "image_sample_c" | "image_sample_c_lz"));
+            if let Some(&reg) = regs.get(first + 2)
+                && self.cube_array_face(inst, reg)
+            {
+                kind = 9;
+                #[cfg(test)]
+                {
+                    self.cube_arrays += 1;
+                }
             }
         }
         // With a16, two 16-bit components per VGPR, low half first.
@@ -5673,12 +5718,16 @@ impl<'a> Lower<'a> {
             if *d16 || *a16 {
                 return Err("a 16-bit image atomic");
             }
-            // dmask: the data dwords (cmpswap: twice the value's).
-            // shortcut: 64-bit image atomics (two dwords, an R32G32 view)
-            // need the host's 64-bit typed atomics; they stop the program.
-            if *dmask != if code == u32::MAX { 3 } else { 1 } {
-                return Err("a 64-bit image atomic");
-            }
+            // dmask: the data dwords (cmpswap: twice the value's). Two per
+            // value are a 64-bit atomic on an R32G32 view, which the host
+            // runs as a 64-bit typed atomic (SM 6.6) on its R32G32_UINT view.
+            let cmpswap = code == u32::MAX;
+            let values = if cmpswap { 2 } else { 1 };
+            let wide = match *dmask {
+                m if m == (1 << values) - 1 => false,
+                m if m == (1 << (2 * values)) - 1 => true,
+                _ => return Err("an image atomic of some channels"),
+            };
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
@@ -5687,42 +5736,69 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image atomic data");
             };
-            let vals = self.vgprs(inst, data, if code == u32::MAX { 2 } else { 1 })?;
-            let mut value = vals[0];
-            if op == "sub" {
-                let z = self.s.m.i32(0);
-                value = self.s.m.bin(c, Bin::Sub, z, value);
-            }
-            let old = match inst.read(Reg::V(reg)) {
-                Some(v) if cache.glc => self.i32_of(v)?,
-                _ => self.s.m.i32(0),
+            let dwords = if wide { 2 } else { 1 };
+            let words = self.vgprs(inst, data, values * dwords)?;
+            let ty = if wide {
+                self.s.flags |= flags::INT64 | flags::ATOMIC64_TYPED;
+                if matches!(src, Source::Loaded { .. }) {
+                    self.s.flags |= flags::ATOMIC64_HEAP;
+                }
+                self.s.m.int(64)
+            } else {
+                self.s.t.i32
             };
-            let h = self.handle(site, src, false, (kind | 0x1000, 0x105))?;
+            let mut vals: Vec<V> = if wide {
+                words.chunks(2).map(|w| self.join64(w[0], w[1])).collect()
+            } else {
+                words
+            };
+            if op == "sub" {
+                let z = self.s.m.int_const(ty, 0);
+                vals[0] = self.s.m.bin(c, Bin::Sub, z, vals[0]);
+            }
+            // What a lane the guard skips keeps: its data registers, else 0.
+            let olds = (0..dwords)
+                .map(|k| inst.read(Reg::V(reg + k)))
+                .collect::<Option<Vec<_>>>();
+            let old = match olds {
+                Some(olds) if cache.glc => {
+                    let lo = self.i32_of(olds[0])?;
+                    if wide {
+                        let hi = self.i32_of(olds[1])?;
+                        self.join64(lo, hi)
+                    } else {
+                        lo
+                    }
+                }
+                _ => self.s.m.int_const(ty, 0),
+            };
+            let element = if wide { 0x107 } else { 0x105 };
+            let h = self.handle(site, src, false, (kind | 0x1000, element))?;
             let at = self.begin_guarded(guard);
-            let i32t = self.s.t.i32;
+            let suffix = if wide { "i64" } else { "i32" };
             let mut args = vec![h];
-            let r = if code == u32::MAX {
+            let r = if cmpswap {
                 // cmpswap: data is (new, compare).
                 args.extend(cs);
                 args.extend([vals[1], vals[0]]);
-                self.s.op(
-                    self.cur,
-                    "atomicCompareExchange.i32",
-                    Attr::NoUnwind,
-                    i32t,
-                    79,
-                    &args,
-                )
+                let name = format!("atomicCompareExchange.{suffix}");
+                self.s.op(self.cur, &name, Attr::NoUnwind, ty, 79, &args)
             } else {
                 args.push(self.s.m.i32(code));
                 args.extend(cs);
-                args.push(value);
-                self.s
-                    .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
+                args.push(vals[0]);
+                let name = format!("atomicBinOp.{suffix}");
+                self.s.op(self.cur, &name, Attr::NoUnwind, ty, 78, &args)
             };
             let r = self.end_guarded(at, &[(r, old)])[0];
             if cache.glc {
-                self.write(inst, Reg::V(reg), r, None);
+                if wide {
+                    let (lo, hi) = self.split64(r);
+                    self.write(inst, Reg::V(reg), lo, None);
+                    self.write(inst, Reg::V(reg + 1), hi, None);
+                } else {
+                    self.write(inst, Reg::V(reg), r, None);
+                }
             }
             return Ok(());
         }
@@ -5730,11 +5806,10 @@ impl<'a> Lower<'a> {
             if name != "image_store" {
                 return Err("an image store to a mip level");
             }
-            // shortcut: stores are taken to write all four channels of a
-            // float format (the console converts by the view's format).
-            if *dmask != 0xF {
-                return Err("an image store of some channels");
-            }
+            // shortcut: stores are taken to be of a float format (the
+            // console converts by the view's format). The channels dmask
+            // leaves out are written as 0: DXIL writes all four of a typed
+            // view, and those past the view's format are dropped anyway.
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
@@ -5744,13 +5819,21 @@ impl<'a> Lower<'a> {
                 return Err("image store data");
             };
             let mut vals = Vec::new();
-            for k in 0..4u8 {
-                // d16: two f16 channels per VGPR, low half first.
+            let mut k = 0u8;
+            for channel in 0..4 {
+                if *dmask >> channel & 1 == 0 {
+                    vals.push(self.s.m.f32(0));
+                    continue;
+                }
+                // The enabled channels in consecutive VGPRs; d16: two f16
+                // channels per VGPR, low half first.
                 let r = if *d16 { k / 2 } else { k };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
+                let high = k % 2 == 1;
+                k += 1;
                 vals.push(if *d16 {
                     let mut x = self.i32_of(v)?;
-                    if k % 2 == 1 {
+                    if high {
                         let k16 = self.s.m.i32(16);
                         x = self.s.m.bin(self.cur, Bin::LShr, x, k16);
                     }
@@ -5869,12 +5952,22 @@ impl<'a> Lower<'a> {
                 let x = addr_val(self, first + grads + k)?;
                 *slot = to_float(self, x);
             }
-            if kind == 5 {
+            if kind == 5 || kind == 9 {
                 if *unorm || op == 63 || op == 81 {
                     return Err("a cube sample with texel coordinates, gradients or a level query");
                 }
-                let dir = self.cube_direction(cs[0], cs[1], cs[2]);
+                // The face operand: face id + 8 × slice for a cube array.
+                let i32t = self.s.t.i32;
+                let id = self.s.m.cast(c, Cast::FpToUi, cs[2], i32t);
+                let k7 = self.s.m.i32(7);
+                let face = self.s.m.bin(c, Bin::And, id, k7);
+                let dir = self.cube_direction(cs[0], cs[1], face);
                 cs[..3].copy_from_slice(&dir);
+                if kind == 9 {
+                    let k3 = self.s.m.i32(3);
+                    let slice = self.s.m.bin(c, Bin::LShr, id, k3);
+                    cs[3] = self.s.m.cast(c, Cast::UiToFp, slice, self.s.t.f32);
+                }
             }
             if *unorm {
                 // Texel coordinates: divided by the size of level 0.
@@ -6111,13 +6204,37 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Whether a cube sample's face operand (register `reg` as `inst`
+    /// reads it) is a cube array's: the face id plus 8 × the slice, which
+    /// compilers emit as one multiply-add of the literal 8.0 onto the
+    /// result of `v_cubeid`.
+    // shortcut: a cube array sampled at a slice the compiler folded to 0
+    // reads as a plain cube (the host view's own first cube).
+    fn cube_array_face(&self, inst: &Inst, reg: u8) -> bool {
+        let Some(face) = inst.read(Reg::V(reg)) else {
+            return false;
+        };
+        let insts = || self.x.p.blocks.iter().flat_map(|b| &b.insts);
+        let defined_by = |v: Value, name: &str| {
+            insts().any(|i| i.name() == name && i.writes.iter().any(|w| w.1 == v))
+        };
+        insts()
+            .filter(|i| i.writes.iter().any(|w| w.1 == face))
+            .any(|i| {
+                let Fields::Valu(v) = &i.fields else {
+                    return false;
+                };
+                let eight = v.src.contains(&Operand::Literal(8f32.to_bits()));
+                eight && i.reads.iter().any(|r| defined_by(r.1, "v_cubeid_f32"))
+            })
+    }
+
     /// The direction a cube sample's face coordinates stand for: the
     /// console takes s and t in [1, 2] (`v_cubesc`/`v_cubetc` over
-    /// `|v_cubema|`, plus 1.5) and the face id (`v_cubeid`), which the
-    /// host's cube sampling turns back into the same texel.
-    // shortcut: the view is taken as a cube, not a cube array (whose face
-    // operand adds 8 × the slice).
-    fn cube_direction(&mut self, s: V, t: V, face: V) -> [V; 3] {
+    /// `|v_cubema|`, plus 1.5) and the face id (`v_cubeid`, here as an
+    /// integer 0-5), which the host's cube sampling turns back into the
+    /// same texel.
+    fn cube_direction(&mut self, s: V, t: V, f: V) -> [V; 3] {
         let c = self.cur;
         let k = |l: &mut Self, v: f32| l.s.m.f32(v.to_bits());
         let (two, three) = (k(self, 2.0), k(self, 3.0));
@@ -6131,7 +6248,6 @@ impl<'a> Lower<'a> {
             self.s.m.bin(c, Bin::Sub, z, v),
         );
         let (one, mone) = (k(self, 1.0), k(self, -1.0));
-        let f = self.s.m.cast(c, Cast::FpToUi, face, self.s.t.i32);
         // Per face +x, -x, +y, -y, +z, -z.
         let table = [
             [one, mone, u, u, u, nu],
@@ -7266,6 +7382,145 @@ mod tests {
             assert_eq!(l.nonuniform_handles, 1);
             assert!(!l.wave_ops);
         }
+    }
+
+    /// A 2D image UAV descriptor from the table at s0, then `access` on
+    /// it with coordinates v[0:1] and data from v4 on, and v4 stored to LDS
+    /// (an atomic's returned value).
+    fn image_access(access: [u32; 2]) -> Result<Lowered, crate::ShaderError> {
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0202,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], null
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0x7E08_0281, // v_mov_b32 v4, 1
+            0x7E0A_0280, // v_mov_b32 v5, 0
+            0x7E0C_0282, // v_mov_b32 v6, 2
+            0x7E0E_0280, // v_mov_b32 v7, 0
+            access[0],
+            access[1],
+            0xD834_0000,
+            0x0000_0400, // ds_write_b32 v0, v4
+            S_ENDPGM,
+        ];
+        let used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        }];
+        lower_with(&words, vec![root(RootType::Table, 0, 0)], used)
+    }
+
+    /// The `SFI0` feature bits of a lowered program.
+    fn features(l: &Lowered) -> u64 {
+        let c = crate::dxbc::Container::parse(&l.dxil).unwrap();
+        let part = c.part(crate::dxbc::FourCC::SFI0).unwrap();
+        u64::from_le_bytes(part.data[..8].try_into().unwrap())
+    }
+
+    fn declares(l: &Lowered, op: &str) -> bool {
+        l.functions.iter().any(|f| f == &format!("dx.op.{op}"))
+    }
+
+    #[test]
+    fn image_atomics_of_two_dwords_are_64_bit_typed_atomics() {
+        // image_atomic_add v[4:5], v[0:1], s[8:15] dmask:0x3 dim:2D glc
+        let add = image_access([0xF044_2308, 0x0002_0400]).unwrap();
+        assert!(declares(&add, "atomicBinOp.i64"));
+        // 64-bit integers, 64-bit typed atomics, on a heap resource.
+        assert_eq!(features(&add) & 0x1040_8000, 0x1040_8000);
+
+        // image_atomic_cmpswap v[4:7], v[0:1], s[8:15] dmask:0xf dim:2D glc
+        let cmpswap = image_access([0xF040_2F08, 0x0002_0400]).unwrap();
+        assert!(declares(&cmpswap, "atomicCompareExchange.i64"));
+
+        // One dword stays a 32-bit atomic, with no 64-bit feature.
+        // image_atomic_add v4, v[0:1], s[8:15] dmask:0x1 dim:2D glc
+        let narrow = image_access([0xF044_2108, 0x0002_0400]).unwrap();
+        assert!(declares(&narrow, "atomicBinOp.i32"));
+        assert!(!declares(&narrow, "atomicBinOp.i64"));
+        assert_eq!(features(&narrow) & 0x1040_0000, 0);
+
+        // Three dwords are neither.
+        // image_atomic_add v[4:6], v[0:1], s[8:15] dmask:0x7 dim:2D glc
+        assert!(image_access([0xF044_2708, 0x0002_0400]).is_err());
+    }
+
+    #[test]
+    fn image_stores_of_some_channels_write_the_others_as_zero() {
+        // image_store v4, v[0:1], s[8:15] dmask:0x1 dim:2D (an R32 view)
+        let one = image_access([0xF020_0108, 0x0002_0400]).unwrap();
+        assert!(declares(&one, "textureStore.f32"));
+        // image_store v[4:5], v[0:1], s[8:15] dmask:0x5 dim:2D
+        let two = image_access([0xF020_0508, 0x0002_0400]).unwrap();
+        assert!(declares(&two, "textureStore.f32"));
+        // image_store v[4:5], v[0:1], s[8:15] dmask:0x7 dim:2D d16: three
+        // halves in two VGPRs.
+        assert!(image_access([0xF020_0708, 0x8002_0400]).is_ok());
+    }
+
+    /// A cube sample at face coordinates v[6:8] after `face` set v8 from
+    /// `v_cubeid`, with a texture table at s0 and a sampler table at s1,
+    /// and the result stored to LDS.
+    fn cube_sample(face: &[u32]) -> Lowered {
+        let mut words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], null
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF408_0203,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], null
+            0xD544_0008,
+            0x040A_0300, // v_cubeid_f32 v8, v0, v1, v2
+        ];
+        words.extend(face);
+        words.extend([
+            0xF09C_0F18,
+            0x0043_0C06, // image_sample_lz v[12:15], v[6:8], s[12:19], s[8:11] dmask:0xf dim:CUBE
+            0xD834_0000,
+            0x0000_0C00, // ds_write_b32 v0, v12
+            S_ENDPGM,
+        ]);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let text: Vec<String> = crate::gfx10::decode(&code)
+            .unwrap()
+            .iter()
+            .map(|i| i.text(false))
+            .collect();
+        assert!(
+            text.iter()
+                .any(|t| t.starts_with("v_cubeid_f32 v8, v0, v1, v2")),
+            "{text:?}"
+        );
+        assert!(
+            text.iter().any(|t| t.starts_with("image_sample_lz")),
+            "{text:?}"
+        );
+        let (layout, used) = texture_tables();
+        lower_with(&words, layout, used).unwrap()
+    }
+
+    #[test]
+    fn cube_samples_at_a_slice_are_cube_array_samples() {
+        // The face as it comes: a plain cube.
+        let cube = cube_sample(&[]);
+        assert!(declares(&cube, "sampleLevel.f32"));
+        assert_eq!(cube.cube_arrays, 0);
+        // v_fmac_f32 v8, 0x41000000, v3: face + 8 × slice, a cube array.
+        let array = cube_sample(&[0x5610_06FF, 0x4100_0000]);
+        assert!(declares(&array, "sampleLevel.f32"));
+        assert_eq!(array.cube_arrays, 1);
+        // Another multiplier is not a slice.
+        let other = cube_sample(&[0x5610_06FF, 0x4080_0000]);
+        assert_eq!(other.cube_arrays, 0);
     }
 
     #[test]
