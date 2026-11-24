@@ -158,6 +158,38 @@ struct State {
     results: VecDeque<ApuResult>,
     commands: u32,
     dequeued: u32,
+    packets: Packets,
+}
+
+/// How the title's packets fill their input lengths, which must be
+/// multiples of 16 bytes. Decoding is right only if the packets carry that
+/// as Opus padding (code 3 with the padding flag): zeros after a packet
+/// would be decoded as part of it.
+#[derive(Default)]
+struct Packets {
+    seen: u32,
+    aligned: u32,
+    opus_padded: u32,
+}
+
+impl Packets {
+    /// Packets counted before the counts are logged, once per connection.
+    const REPORT_AFTER: u32 = 256;
+
+    fn count(&mut self, packet: &[u8]) {
+        self.seen += 1;
+        self.aligned += u32::from(packet.len().is_multiple_of(16));
+        let padded = packet.len() >= 2 && packet[0] & 3 == 3 && packet[1] & 0x40 != 0;
+        self.opus_padded += u32::from(padded);
+        if self.seen == Self::REPORT_AFTER {
+            tracing::info!(
+                packets = self.seen,
+                lengths_multiple_of_16 = self.aligned,
+                opus_padded = self.opus_padded,
+                "Opus packets as the title passes them"
+            );
+        }
+    }
 }
 
 fn lock(c: &Connection) -> std::sync::MutexGuard<'_, State> {
@@ -237,6 +269,7 @@ pub extern "system" fn XApuConnect(
             results: VecDeque::new(),
             commands: 0,
             dequeued: 0,
+            packets: Packets::default(),
         }),
     });
     // SAFETY: checked non-null.
@@ -296,6 +329,21 @@ pub extern "system" fn XApuEnqueueCommand(
         input_length: 0,
         input: std::ptr::null(),
     };
+    // Opus packets only: PCM conversion takes samples.
+    if id.kind == PROCESS
+        && connection.process != CONVERT_PCM
+        && state.packets.seen < Packets::REPORT_AFTER
+    {
+        // SAFETY: a process command is this struct.
+        let command = unsafe { command.cast::<Process>().read_unaligned() };
+        let (input, length) = (command.input, command.input_length);
+        if !input.is_null() && length > 0 {
+            // SAFETY: the title's packet in its connection memory.
+            state
+                .packets
+                .count(unsafe { std::slice::from_raw_parts(input, length as usize) });
+        }
+    }
     let stream_state = &mut state.streams[stream];
     match id.kind {
         ACTIVATE => {
@@ -658,6 +706,23 @@ mod tests {
                 assert!(decode(options, at) == aligned, "offset {at}");
             }
         }
+    }
+
+    #[test]
+    fn packets_are_counted_by_how_they_fill_16_bytes() {
+        let mut packets = Packets::default();
+        // Code 0, 16 bytes: aligned, but by bytes after the frame.
+        packets.count(&[0xfc; 16]);
+        // Code 3 with the padding flag: Opus's own padding.
+        let mut padded = [0u8; 32];
+        (padded[0], padded[1], padded[2]) = (0xfc | 3, 0x40 | 1, 20);
+        packets.count(&padded);
+        // Neither.
+        packets.count(&[0xfc; 13]);
+        assert_eq!(
+            (packets.seen, packets.aligned, packets.opus_padded),
+            (3, 2, 1)
+        );
     }
 
     #[test]
