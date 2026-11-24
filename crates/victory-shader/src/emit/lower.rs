@@ -29,6 +29,9 @@ enum Val {
     Missing(Why),
 }
 
+/// A heap handle's block, load, first dword, kind and annotation.
+type HandleKey = (usize, Site, u8, bool, (u32, u32));
+
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
     /// Bit n: immediate sampler n is used for comparisons.
@@ -43,6 +46,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// The functions the program declares (`dx.op.<name>`).
+    #[cfg(test)]
+    pub functions: Vec<String>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -173,7 +179,7 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    handles: HashMap<HandleKey, V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -910,6 +916,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            functions: self.s.m.function_names(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -3308,7 +3316,7 @@ impl<'a> Lower<'a> {
     ) -> Result<V, Why> {
         match src {
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props.0);
+                let key = (self.cur, *load, *first, sampler, props);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
@@ -4296,6 +4304,17 @@ impl<'a> Lower<'a> {
                 Ok(self.s.m.cast(c, Cast::ZExt, x, i64t))
             }
         }
+    }
+
+    /// The i64 of a low and a high dword.
+    fn join64(&mut self, lo: V, hi: V) -> V {
+        let c = self.cur;
+        let i64t = self.s.m.int(64);
+        let lo = self.s.m.cast(c, Cast::ZExt, lo, i64t);
+        let hi = self.s.m.cast(c, Cast::ZExt, hi, i64t);
+        let k32 = self.s.m.int_const(i64t, 32);
+        let hi = self.s.m.bin(c, Bin::Shl, hi, k32);
+        self.s.m.bin(c, Bin::Or, lo, hi)
     }
 
     /// The low and high dwords of an i64.
@@ -5673,12 +5692,16 @@ impl<'a> Lower<'a> {
             if *d16 || *a16 {
                 return Err("a 16-bit image atomic");
             }
-            // dmask: the data dwords (cmpswap: twice the value's).
-            // shortcut: 64-bit image atomics (two dwords, an R32G32 view)
-            // need the host's 64-bit typed atomics; they stop the program.
-            if *dmask != if code == u32::MAX { 3 } else { 1 } {
-                return Err("a 64-bit image atomic");
-            }
+            // dmask: the data dwords (cmpswap: twice the value's). Two per
+            // value are a 64-bit atomic on an R32G32 view, which the host
+            // runs as a 64-bit typed atomic (SM 6.6) on its R32G32_UINT view.
+            let cmpswap = code == u32::MAX;
+            let values = if cmpswap { 2 } else { 1 };
+            let wide = match *dmask {
+                m if m == (1 << values) - 1 => false,
+                m if m == (1 << (2 * values)) - 1 => true,
+                _ => return Err("an image atomic of some channels"),
+            };
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
@@ -5687,42 +5710,69 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image atomic data");
             };
-            let vals = self.vgprs(inst, data, if code == u32::MAX { 2 } else { 1 })?;
-            let mut value = vals[0];
-            if op == "sub" {
-                let z = self.s.m.i32(0);
-                value = self.s.m.bin(c, Bin::Sub, z, value);
-            }
-            let old = match inst.read(Reg::V(reg)) {
-                Some(v) if cache.glc => self.i32_of(v)?,
-                _ => self.s.m.i32(0),
+            let dwords = if wide { 2 } else { 1 };
+            let words = self.vgprs(inst, data, values * dwords)?;
+            let ty = if wide {
+                self.s.flags |= flags::INT64 | flags::ATOMIC64_TYPED;
+                if matches!(src, Source::Loaded { .. }) {
+                    self.s.flags |= flags::ATOMIC64_HEAP;
+                }
+                self.s.m.int(64)
+            } else {
+                self.s.t.i32
             };
-            let h = self.handle(site, src, false, (kind | 0x1000, 0x105))?;
+            let mut vals: Vec<V> = if wide {
+                words.chunks(2).map(|w| self.join64(w[0], w[1])).collect()
+            } else {
+                words
+            };
+            if op == "sub" {
+                let z = self.s.m.int_const(ty, 0);
+                vals[0] = self.s.m.bin(c, Bin::Sub, z, vals[0]);
+            }
+            // What a lane the guard skips keeps: its data registers, else 0.
+            let olds = (0..dwords)
+                .map(|k| inst.read(Reg::V(reg + k)))
+                .collect::<Option<Vec<_>>>();
+            let old = match olds {
+                Some(olds) if cache.glc => {
+                    let lo = self.i32_of(olds[0])?;
+                    if wide {
+                        let hi = self.i32_of(olds[1])?;
+                        self.join64(lo, hi)
+                    } else {
+                        lo
+                    }
+                }
+                _ => self.s.m.int_const(ty, 0),
+            };
+            let element = if wide { 0x107 } else { 0x105 };
+            let h = self.handle(site, src, false, (kind | 0x1000, element))?;
             let at = self.begin_guarded(guard);
-            let i32t = self.s.t.i32;
+            let suffix = if wide { "i64" } else { "i32" };
             let mut args = vec![h];
-            let r = if code == u32::MAX {
+            let r = if cmpswap {
                 // cmpswap: data is (new, compare).
                 args.extend(cs);
                 args.extend([vals[1], vals[0]]);
-                self.s.op(
-                    self.cur,
-                    "atomicCompareExchange.i32",
-                    Attr::NoUnwind,
-                    i32t,
-                    79,
-                    &args,
-                )
+                let name = format!("atomicCompareExchange.{suffix}");
+                self.s.op(self.cur, &name, Attr::NoUnwind, ty, 79, &args)
             } else {
                 args.push(self.s.m.i32(code));
                 args.extend(cs);
-                args.push(value);
-                self.s
-                    .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
+                args.push(vals[0]);
+                let name = format!("atomicBinOp.{suffix}");
+                self.s.op(self.cur, &name, Attr::NoUnwind, ty, 78, &args)
             };
             let r = self.end_guarded(at, &[(r, old)])[0];
             if cache.glc {
-                self.write(inst, Reg::V(reg), r, None);
+                if wide {
+                    let (lo, hi) = self.split64(r);
+                    self.write(inst, Reg::V(reg), lo, None);
+                    self.write(inst, Reg::V(reg + 1), hi, None);
+                } else {
+                    self.write(inst, Reg::V(reg), r, None);
+                }
             }
             return Ok(());
         }
@@ -7266,6 +7316,74 @@ mod tests {
             assert_eq!(l.nonuniform_handles, 1);
             assert!(!l.wave_ops);
         }
+    }
+
+    /// A 2D image UAV descriptor from the table at s0, then `atomic` on
+    /// it with coordinates v[0:1] and data from v4 on, and its returned
+    /// value stored to LDS.
+    fn image_atomic(atomic: [u32; 2]) -> Result<Lowered, crate::ShaderError> {
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0202,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], null
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0x7E08_0281, // v_mov_b32 v4, 1
+            0x7E0A_0280, // v_mov_b32 v5, 0
+            0x7E0C_0282, // v_mov_b32 v6, 2
+            0x7E0E_0280, // v_mov_b32 v7, 0
+            atomic[0],
+            atomic[1],
+            0xD834_0000,
+            0x0000_0400, // ds_write_b32 v0, v4
+            S_ENDPGM,
+        ];
+        let used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        }];
+        lower_with(&words, vec![root(RootType::Table, 0, 0)], used)
+    }
+
+    /// The `SFI0` feature bits of a lowered program.
+    fn features(l: &Lowered) -> u64 {
+        let c = crate::dxbc::Container::parse(&l.dxil).unwrap();
+        let part = c.part(crate::dxbc::FourCC::SFI0).unwrap();
+        u64::from_le_bytes(part.data[..8].try_into().unwrap())
+    }
+
+    fn declares(l: &Lowered, op: &str) -> bool {
+        l.functions.iter().any(|f| f == &format!("dx.op.{op}"))
+    }
+
+    #[test]
+    fn image_atomics_of_two_dwords_are_64_bit_typed_atomics() {
+        // image_atomic_add v[4:5], v[0:1], s[8:15] dmask:0x3 dim:2D glc
+        let add = image_atomic([0xF044_2308, 0x0002_0400]).unwrap();
+        assert!(declares(&add, "atomicBinOp.i64"));
+        // 64-bit integers, 64-bit typed atomics, on a heap resource.
+        assert_eq!(features(&add) & 0x1040_8000, 0x1040_8000);
+
+        // image_atomic_cmpswap v[4:7], v[0:1], s[8:15] dmask:0xf dim:2D glc
+        let cmpswap = image_atomic([0xF040_2F08, 0x0002_0400]).unwrap();
+        assert!(declares(&cmpswap, "atomicCompareExchange.i64"));
+
+        // One dword stays a 32-bit atomic, with no 64-bit feature.
+        // image_atomic_add v4, v[0:1], s[8:15] dmask:0x1 dim:2D glc
+        let narrow = image_atomic([0xF044_2108, 0x0002_0400]).unwrap();
+        assert!(declares(&narrow, "atomicBinOp.i32"));
+        assert!(!declares(&narrow, "atomicBinOp.i64"));
+        assert_eq!(features(&narrow) & 0x1040_0000, 0);
+
+        // Three dwords are neither.
+        // image_atomic_add v[4:6], v[0:1], s[8:15] dmask:0x7 dim:2D glc
+        assert!(image_atomic([0xF044_2708, 0x0002_0400]).is_err());
     }
 
     #[test]
