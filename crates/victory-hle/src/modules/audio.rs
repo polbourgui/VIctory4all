@@ -301,9 +301,15 @@ pub extern "system" fn AcpHalReleaseShapeContexts() -> HRESULT {
 //    9: read block (0-4).
 // Titles read back only the write block, "writable" and the read block,
 // and take whatever lies between read and write.
-// shortcut: each enabled context decodes from a cold state and the overlap
-// buffer is ignored (titles copy it between consecutive contexts of one
-// voice); keep decoder state there if a title's seams turn out audible.
+// The overlap buffer (word 8) is, by its name and use, where the hardware
+// keeps the half frame still to be overlapped when a context's input runs
+// out; titles copy it between consecutive contexts of one voice. We keep
+// the decoder itself instead and leave a ticket for it there (see
+// `Carried`), so the next context of the voice goes on seamlessly. Without
+// an overlap buffer a voice ends with its overlap tail, as a whole stream
+// does.
+// shortcut: the buffer's own contents are not the hardware's, so a title
+// that reads them (rather than copying them) would see our ticket.
 
 use victory_formats::xma;
 
@@ -312,6 +318,53 @@ const ENABLE_XMAS: u32 = 6;
 const DISABLE_XMA: u32 = 7;
 const DISABLE_XMAS: u32 = 8;
 const ADVANCE_XMA_READ: u32 = 18;
+
+/// Our ticket in an overlap buffer: this tag, then a `Carried` key.
+const OVERLAP_TAG: u32 = u32::from_le_bytes(*b"VxOv");
+/// Decoders kept for contexts that may never come; the oldest go first.
+const MAX_CARRIED: usize = 64;
+
+/// Decoders whose context ran out of input with an overlap buffer, waiting
+/// for the next context of the voice to find their ticket there.
+struct Carried {
+    next: u32,
+    decoders: VecDeque<(u32, xma::Decoder)>,
+}
+
+static CARRIED: Mutex<Carried> = Mutex::new(Carried {
+    next: 1,
+    decoders: VecDeque::new(),
+});
+
+/// Keeps `decoder` and leaves its ticket in `ticket`, the first 8 bytes of
+/// an overlap buffer.
+fn carry(ticket: &mut [u8], decoder: xma::Decoder) {
+    let mut carried = lock(&CARRIED);
+    let key = carried.next;
+    carried.next = carried.next.wrapping_add(1).max(1);
+    if carried.decoders.len() >= MAX_CARRIED {
+        carried.decoders.pop_front();
+    }
+    carried.decoders.push_back((key, decoder));
+    ticket[..4].copy_from_slice(&OVERLAP_TAG.to_le_bytes());
+    ticket[4..8].copy_from_slice(&key.to_le_bytes());
+}
+
+/// The decoder whose ticket the overlap buffer at `apu` holds, if it
+/// decodes this many channels; the ticket is used up either way.
+fn take_carried(apu: u32, channels: usize) -> Option<xma::Decoder> {
+    let ticket = heap_bytes(apu, 8)?;
+    let word = |i: usize| u32::from_le_bytes(ticket[i..i + 4].try_into().unwrap());
+    if word(0) != OVERLAP_TAG {
+        return None;
+    }
+    let key = word(4);
+    ticket.fill(0);
+    let mut carried = lock(&CARRIED);
+    let at = carried.decoders.iter().position(|&(k, _)| k == key)?;
+    let (_, decoder) = carried.decoders.remove(at)?;
+    (decoder.channels() == channels).then_some(decoder)
+}
 
 const BLOCK_BYTES: usize = 256;
 const SAMPLES_PER_BLOCK: usize = BLOCK_BYTES / 2;
@@ -417,8 +470,15 @@ impl Xma {
         );
         #[cfg(feature = "diagnostics")]
         dump_input(index, context);
+        let carried = match context.get(8) {
+            0 => None,
+            apu => take_carried(apu, context.channels()),
+        };
+        if carried.is_some() {
+            tracing::debug!(index, "XMA voice goes on from its overlap buffer");
+        }
         *slot = Some(Voice {
-            decoder: None,
+            decoder: carried,
             pcm: VecDeque::new(),
             skip: context.field(1, 24, 3) as usize * xma::SUBFRAME_SAMPLES,
             ended: false,
@@ -552,11 +612,18 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     let valid = context.field(0, 20, 2);
     if valid & (1 << current) == 0 {
         if valid & (1 << (1 - current)) == 0 {
-            // Out of input: the overlap tail, then nothing.
-            if let Some(decoder) = &mut voice.decoder {
-                let mut tail = Vec::new();
-                decoder.flush(&mut tail);
-                voice.pcm.extend(tail);
+            // Out of input: the overlap tail goes to the overlap buffer if
+            // there is one, else out; then nothing.
+            if let Some(mut decoder) = voice.decoder.take() {
+                let overlap = context.get(8);
+                match (overlap != 0).then(|| heap_bytes(overlap, 8)).flatten() {
+                    Some(ticket) => carry(ticket, decoder),
+                    None => {
+                        let mut tail = Vec::new();
+                        decoder.flush(&mut tail);
+                        voice.pcm.extend(tail);
+                    }
+                }
             }
             voice.ended = true;
             voice.trace.ended_ms = Some(voice.trace.since.elapsed().as_millis());
@@ -1316,6 +1383,94 @@ mod tests {
         // No loops left: both frames whole, and on to the third.
         assert_eq!(step(third), 4 * subframe);
         ApuFree(input);
+    }
+
+    #[test]
+    fn consecutive_contexts_carry_the_decoder_through_the_overlap_buffer() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let mut request = ShapeContexts {
+            counts: [0, 0, 0, 0, 4, 0],
+            arrays: [std::ptr::null_mut(); 6],
+            apu: [0; 6],
+        };
+        assert_eq!(AcpHalAllocateShapeContexts(&mut request), S_OK);
+        let context = |i: usize| Context(request.arrays[4].cast::<u32>().wrapping_add(16 * i));
+        let alloc = |size: u32, align: u32| {
+            let (mut host, mut apu) = (std::ptr::null_mut(), 0);
+            assert_eq!(ApuAlloc(&mut host, &mut apu, size, align, 1), S_OK);
+            (host.cast::<u8>(), apu)
+        };
+        let (input, input_apu) = alloc(0x1000, 0x800);
+        let stream = silent_stream();
+        // SAFETY: two packets were allocated.
+        unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), input, stream.len()) };
+        // A ring large enough for the whole stream, and one overlap buffer
+        // per context.
+        let (output, output_apu) = alloc(0x2000, 0x100);
+        let (overlap_a, overlap_a_apu) = alloc(0x400, 0x100);
+        let (overlap_b, overlap_b_apu) = alloc(0x400, 0x100);
+        let set_up = |c: Context, overlap: u32| {
+            c.set(0, 2 | 1 << 20 | 31 << 22);
+            c.set(1, 1 << 31 | 3 << 27);
+            c.set(2, 32);
+            c.set(5, input_apu);
+            c.set(7, output_apu);
+            c.set(8, overlap);
+        };
+
+        let mut acp = std::ptr::null_mut();
+        assert_eq!(AcpHalCreate(&mut acp), S_OK);
+        // SAFETY: just created.
+        let m = unsafe { (*acp).vtable };
+        assert_eq!((m.connect)(acp, 0x1000, 0x1000), S_OK);
+        let submit = |command: u32, words: &[u32]| {
+            assert_eq!(
+                (m.submit)(acp, command, 0xf1, u32::MAX, words.as_ptr().cast(), 0),
+                S_OK
+            );
+        };
+        let voice =
+            |i: usize, f: &dyn Fn(&Voice) -> bool| lock(&xma().voices[i]).as_ref().is_some_and(f);
+
+        // The first context of the voice runs out of input: six frames and
+        // no tail, which waits in the overlap buffer instead.
+        set_up(context(1), overlap_a_apu);
+        submit(ENABLE_XMA, &[1]);
+        for _ in 0..20 {
+            xma().pump();
+            if context(1).field(2, 31, 1) == 1 && voice(1, &|v| v.pcm.is_empty()) {
+                break;
+            }
+        }
+        assert!(voice(1, &|v| v.trace.produced == 6 * xma::FRAME_SAMPLES));
+        // SAFETY: the overlap buffer was allocated above.
+        let ticket = unsafe { std::slice::from_raw_parts(overlap_a, 8) };
+        assert_eq!(ticket[..4], OVERLAP_TAG.to_le_bytes());
+        submit(DISABLE_XMA, &[1]);
+
+        // The title copies it to the next context, which goes on with the
+        // same decoder; the ticket is used up.
+        // SAFETY: both buffers were allocated above.
+        unsafe { std::ptr::copy_nonoverlapping(overlap_a, overlap_b, 0x400) };
+        set_up(context(2), overlap_b_apu);
+        submit(ENABLE_XMA, &[2]);
+        assert!(voice(2, &|v| v.decoder.is_some()));
+        // SAFETY: allocated above.
+        let ticket = unsafe { std::slice::from_raw_parts(overlap_b, 8) };
+        assert!(ticket.iter().all(|&b| b == 0));
+        submit(DISABLE_XMA, &[2]);
+
+        // A context whose overlap buffer holds no ticket starts cold.
+        set_up(context(3), overlap_b_apu);
+        submit(ENABLE_XMA, &[3]);
+        assert!(!voice(3, &|v| v.decoder.is_some()));
+        submit(DISABLE_XMA, &[3]);
+
+        (m.release)(acp);
+        for host in [input, output, overlap_a, overlap_b] {
+            ApuFree(host.cast());
+        }
+        assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
     }
 
     #[test]
