@@ -1409,9 +1409,12 @@ mod tests {
         let (output, output_apu) = alloc(0x2000, 0x100);
         let (overlap_a, overlap_a_apu) = alloc(0x400, 0x100);
         let (overlap_b, overlap_b_apu) = alloc(0x400, 0x100);
-        let set_up = |c: Context, overlap: u32| {
+        let (overlap_c, overlap_c_apu) = alloc(0x400, 0x100);
+        // A ring that is not writable is not decoded into, so the decoding
+        // thread leaves the voice as it was enabled.
+        let set_up = |c: Context, overlap: u32, writable: bool| {
             c.set(0, 2 | 1 << 20 | 31 << 22);
-            c.set(1, 1 << 31 | 3 << 27);
+            c.set(1, u32::from(writable) << 31 | 3 << 27);
             c.set(2, 32);
             c.set(5, input_apu);
             c.set(7, output_apu);
@@ -1434,7 +1437,7 @@ mod tests {
 
         // The first context of the voice runs out of input: six frames and
         // no tail, which waits in the overlap buffer instead.
-        set_up(context(1), overlap_a_apu);
+        set_up(context(1), overlap_a_apu, true);
         submit(ENABLE_XMA, &[1]);
         for _ in 0..20 {
             xma().pump();
@@ -1452,7 +1455,7 @@ mod tests {
         // same decoder; the ticket is used up.
         // SAFETY: both buffers were allocated above.
         unsafe { std::ptr::copy_nonoverlapping(overlap_a, overlap_b, 0x400) };
-        set_up(context(2), overlap_b_apu);
+        set_up(context(2), overlap_b_apu, false);
         submit(ENABLE_XMA, &[2]);
         assert!(voice(2, &|v| v.decoder.is_some()));
         // SAFETY: allocated above.
@@ -1461,13 +1464,13 @@ mod tests {
         submit(DISABLE_XMA, &[2]);
 
         // A context whose overlap buffer holds no ticket starts cold.
-        set_up(context(3), overlap_b_apu);
+        set_up(context(3), overlap_c_apu, false);
         submit(ENABLE_XMA, &[3]);
         assert!(!voice(3, &|v| v.decoder.is_some()));
         submit(DISABLE_XMA, &[3]);
 
         (m.release)(acp);
-        for host in [input, output, overlap_a, overlap_b] {
+        for host in [input, output, overlap_a, overlap_b, overlap_c] {
             ApuFree(host.cast());
         }
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
