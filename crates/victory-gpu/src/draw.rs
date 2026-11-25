@@ -418,10 +418,13 @@ impl State {
             let Some(texture) = crate::resource::host_resource(record.resource) else {
                 continue;
             };
+            let Some(rtv) = host.rtv(&texture, record.desc().as_ref()) else {
+                continue;
+            };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
-            rtvs.push(host.rtv(&texture, record.desc().as_ref()));
+            rtvs.push(rtv);
         }
         self.depth = 0;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
@@ -2107,7 +2110,7 @@ uint ps() : SV_Target { return 1; }
             ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
             ..Default::default()
         };
-        let (rtv, dsv) = (host.rtv(&target, None), host.dsv(texture, Some(&dsv)));
+        let (rtv, dsv) = (host.rtv(&target, None).unwrap(), host.dsv(texture, Some(&dsv)));
         // SAFETY: an open list; the target in the render target state, the
         // depth texture in the depth write state; copies into our buffer.
         unsafe {

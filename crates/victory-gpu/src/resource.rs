@@ -1131,7 +1131,81 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
+    d.flags &= !unsupported_uses(d.format, d.flags);
     Some(d)
+}
+
+/// The uses in `flags` (render target, unordered access) the host device
+/// refuses for typed `format`: support for them is optional for some
+/// formats (16-bit B4G4R4A4 and B5G5R5A1, say: the console and AMD hosts
+/// take them, NVIDIA hosts do not), and a texture made with one, or a view
+/// of it, removes the device. Typeless formats are left as they are: their
+/// views' formats decide.
+// shortcut: the use is dropped, so draws to such a texture and its
+// unordered views are lost on that host. Upgrade with a texture in a wider
+// format the host takes, converted where title memory is copied.
+#[cfg(windows)]
+fn unsupported_uses(format: u32, flags: u32) -> u32 {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT, D3D12_FEATURE_FORMAT_SUPPORT,
+        D3D12_FORMAT_SUPPORT1_RENDER_TARGET, D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    const RENDER_TARGET: u32 = 1;
+    static KNOWN: std::sync::Mutex<Vec<(u32, i32)>> = std::sync::Mutex::new(Vec::new());
+    if flags & (RENDER_TARGET | UNORDERED) == 0 || family(format) == format {
+        return 0;
+    }
+    let support = {
+        let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+        match known.iter().find(|(f, _)| *f == format) {
+            Some(&(_, s)) => s,
+            None => {
+                let mut data = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                    Format: DXGI_FORMAT(format as i32),
+                    ..Default::default()
+                };
+                let Some(host) = crate::host::host() else {
+                    return 0;
+                };
+                // SAFETY: a plain query into a struct of its size.
+                let ok = unsafe {
+                    host.device.CheckFeatureSupport(
+                        D3D12_FEATURE_FORMAT_SUPPORT,
+                        (&raw mut data).cast(),
+                        size_of_val(&data) as u32,
+                    )
+                }
+                .is_ok();
+                // A format the query does not know: nothing is known
+                // refused.
+                let s = if ok { data.Support1.0 } else { -1 };
+                known.push((format, s));
+                s
+            }
+        }
+    };
+    let mut refused = 0;
+    if flags & RENDER_TARGET != 0 && support & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 == 0 {
+        refused |= RENDER_TARGET;
+    }
+    if flags & UNORDERED != 0 && support & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 == 0
+    {
+        refused |= UNORDERED;
+    }
+    if refused != 0 {
+        static ONCE: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
+        let mut once = ONCE.lock().unwrap_or_else(|e| e.into_inner());
+        if !once.contains(&(format, refused)) {
+            once.push((format, refused));
+            tracing::warn!(
+                format,
+                refused,
+                "the host refuses these uses of a texture format: draws and unordered views of such textures are lost"
+            );
+        }
+    }
+    refused
 }
 
 const DEPTH: u32 = 2;
@@ -1305,7 +1379,13 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         value[0] = pc_format(value[0]);
         value
     });
-    let clear_value = clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast::<D3D12_CLEAR_VALUE>());
+    // Only render targets and depth textures take one (`host_desc` may have
+    // dropped the render-target use).
+    const TARGET_OR_DEPTH: u32 = 1 | DEPTH;
+    let clear_value = clear_value
+        .as_ref()
+        .filter(|_| d.flags & TARGET_OR_DEPTH != 0)
+        .map(|v| std::ptr::from_ref(v).cast::<D3D12_CLEAR_VALUE>());
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
