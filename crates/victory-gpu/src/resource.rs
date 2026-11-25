@@ -1153,7 +1153,10 @@ fn unsupported_uses(format: u32, flags: u32) -> u32 {
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
     const RENDER_TARGET: u32 = 1;
     static KNOWN: std::sync::Mutex<Vec<(u32, i32)>> = std::sync::Mutex::new(Vec::new());
-    if flags & (RENDER_TARGET | UNORDERED) == 0 || family(format) == format {
+    // Every family has more than one format, its typeless one first; a
+    // format of no family is its own `family` and typed.
+    let typeless = family(format) == format && family(format + 1) == format;
+    if flags & (RENDER_TARGET | UNORDERED) == 0 || typeless {
         return 0;
     }
     let support = {
