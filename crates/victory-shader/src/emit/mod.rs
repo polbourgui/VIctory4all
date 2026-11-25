@@ -504,6 +504,24 @@ pub fn emit(
                 }
             }
         }
+        // `VICTORY_WAVE_WIDE=last`: wave-wide branches only for a program that no form
+        // above took, which otherwise keeps asking for 64-lane waves and the host refuses
+        // it (its dispatches are dropped). The programs that lost the card with wave-wide
+        // branches tried first (`VICTORY_WAVE_WIDE=1`) keep the forms above.
+        if std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "last") {
+            let bases = [
+                forms[1].1.as_ref().map(|f| &f.0),
+                forms[0].1.as_ref().map(|f| &f.0),
+                Some(p),
+            ];
+            if let Some(base) = bases.into_iter().flatten().next() {
+                let again = widen(c, native, base, why);
+                report("wave-wide branches, last of all", &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
+                }
+            }
+        }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the
