@@ -407,6 +407,40 @@ pub struct UserData {
 /// with that on for every program, 8,551 pixel programs of the title that
 /// already translated came out changed (an extra evaluation in each), for
 /// the sake of 9 that did not translate.
+thread_local! {
+    /// Whether the program being translated on this thread is one of
+    /// `VICTORY_WAVE_WIDE_ONLY` ([`with_wide`]).
+    static WIDE_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `VICTORY_WAVE_WIDE_ONLY=<hash>,...`: the wave-wide form for the
+/// containers whose hash (the first 16 hex digits of the container's
+/// blake3, as a run's log names them) starts with one of these, and for no
+/// other. `VICTORY_WAVE_WIDE=1` puts it on for every program, and lost the
+/// card on NVIDIA in a run; a list keeps it to programs checked one by one.
+pub fn wide_listed(hash: &str) -> bool {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_WIDE_ONLY")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    let hash = hash.to_lowercase();
+    list.iter().any(|h| hash.starts_with(h.as_str()))
+}
+
+/// Runs `f` (a translation) with the wave-wide form on or off for it, as
+/// [`wide_listed`] says of its container.
+pub fn with_wide<T>(on: bool, f: impl FnOnce() -> T) -> T {
+    let was = WIDE_HERE.replace(on);
+    let out = f();
+    WIDE_HERE.set(was);
+    out
+}
+
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     match translate_plain(container) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
@@ -526,7 +560,7 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || WIDE_HERE.get();
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
