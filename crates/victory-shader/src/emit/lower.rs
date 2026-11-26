@@ -7706,9 +7706,13 @@ impl<'a> Lower<'a> {
                     // this lane's bit of it. Exact where host lanes are
                     // the console's.
                     None if self.mask_data == MaskData::Console => {
-                        // Each host wave taken as a wave of its own has no
-                        // console lane numbers to pick the bits by.
-                        if self.local {
+                        // Each host wave taken as a wave of its own picks the
+                        // bits by its console lane numbers (0..31 or 32..63 by
+                        // half), which only a program whose halves exchange has
+                        // (`exchange`: `lane_bit` reads `console_lane`); the
+                        // mask is a constant, so which lanes run elsewhere does
+                        // not matter.
+                        if self.local && self.exchange.is_none() {
                             return Err("a constant lane mask in a half-wave");
                         }
                         let m = mask.ok_or(UNTRACKED)?;
