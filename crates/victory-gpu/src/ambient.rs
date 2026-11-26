@@ -94,12 +94,59 @@ fn parse(set: &str) -> Set {
 
 fn set() -> Set {
     static SET: OnceLock<Set> = OnceLock::new();
-    *SET.get_or_init(|| parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()))
+    *SET.get_or_init(|| match parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()) {
+        // With the band asked for and no share, the band's level.
+        Set::Off => rt_band().map_or(Set::Off, |b| Set::Estimate(b.level)),
+        set => set,
+    })
 }
 
-/// Whether the stand-in is on: set, and the title's rays find nothing.
+/// With ray tracing (`VICTORY_AMBIENT_RT=<least>,<most>[,<level>]`; unset:
+/// off, the title's own light whenever the builder runs): the diffuse light
+/// the title's resolve leaves is kept between `least` and `most` times the
+/// estimate (level: the share of the estimate when `VICTORY_AMBIENT` is not
+/// set, 0.8). After avatarmanz/VIctory-7900XTX 77137b98: with the builder
+/// running, the title's traced light flickers, goes black indoors, or grows
+/// from frame to frame until a NaN scrub resets it (RTX 3060, Series S); its
+/// detail stays inside the band, its swings do not.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) struct Band {
+    least: f32,
+    most: f32,
+    level: f32,
+}
+
+pub(crate) fn rt_band() -> Option<Band> {
+    static SET: OnceLock<Option<Band>> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let band = parse_band(&std::env::var("VICTORY_AMBIENT_RT").ok()?)?;
+        tracing::info!(least = band.least, most = band.most, level = band.level, "the stand-in keeps the traced indirect light in a band (VICTORY_AMBIENT_RT)");
+        Some(band)
+    })
+}
+
+fn parse_band(set: &str) -> Option<Band> {
+    let mut parts = set.split(',').map(|p| p.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 0.0));
+    let least = parts.next().flatten()?;
+    let most = parts.next().flatten().unwrap_or(4.0).max(least).max(1e-3);
+    let level = parts.next().flatten().filter(|v| *v > 0.0).unwrap_or(0.8);
+    Some(Band { least, most, level })
+}
+
+/// Whether the stand-in is on: set, and the title's rays find nothing (or
+/// the band is asked for with them).
 pub(crate) fn on() -> bool {
-    set() != Set::Off && !crate::pipeline::builder_runs()
+    set() != Set::Off && (rt_band().is_some() || !crate::pipeline::builder_runs())
+}
+
+/// The title's leftover light is kept between these multiples of the
+/// estimate: with rays, the band's; without, at least the estimate and at
+/// most `VICTORY_AMBIENT_MOST` times it.
+fn bounds() -> (f32, f32) {
+    match rt_band() {
+        Some(b) if crate::pipeline::builder_runs() => (b.least, b.most),
+        _ => (1.0, most()),
+    }
 }
 
 /// The most the air scatters, as a multiple of the light around
@@ -149,7 +196,7 @@ const SOURCE: &str = r#"
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
-    float follow; float most; float air; float unused;
+    float follow; float most; float air; float least;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -341,7 +388,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float top = max(dot(found, LUMA) * most, 1e-6);
     float has = dot(was, LUMA);
     was *= min(1.0, top / max(has, 1e-6));
-    light[p] = pack(max(was, found));
+    light[p] = pack(max(was, found * least));
 }
 #endif
 "#;
@@ -474,7 +521,9 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[6] = views.size[0];
     words[7] = views.size[1];
     words[8] = 0.04f32.to_bits();
-    words[9] = most().to_bits();
+    let (least, most) = bounds();
+    words[9] = most.to_bits();
+    words[11] = least.to_bits();
     words[10] = air().to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
@@ -516,6 +565,18 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_band_with_rays() {
+        use super::{Band, parse_band};
+        assert_eq!(parse_band("0.5,1.5"), Some(Band { least: 0.5, most: 1.5, level: 0.8 }));
+        assert_eq!(parse_band("1,1,0.6"), Some(Band { least: 1.0, most: 1.0, level: 0.6 }));
+        // The top is never under the floor; a missing top is four times.
+        assert_eq!(parse_band("2,1"), Some(Band { least: 2.0, most: 2.0, level: 0.8 }));
+        assert_eq!(parse_band("0.7"), Some(Band { least: 0.7, most: 4.0, level: 0.8 }));
+        assert_eq!(parse_band(""), None);
+        assert_eq!(parse_band("x,1"), None);
+    }
+
     use super::*;
 
     #[test]
